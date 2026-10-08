@@ -40,6 +40,10 @@ pub struct Synthesizer {
 
     master_volume: f32,
 
+    /// Per-SMF-track gain (1.0 = unity), applied to voices during rendering.
+    /// Indexed by track id; grows on demand in [`Self::set_track_gain`].
+    track_gains: Vec<f32>,
+
     effects: Option<Effects>,
 }
 
@@ -98,6 +102,7 @@ impl Synthesizer {
         let block_read = settings.block_size;
 
         let master_volume = 0.5_f32;
+        let track_gains = vec![1.0_f32];
 
         let effects = if settings.enable_reverb_and_chorus {
             Some(Effects::new(settings))
@@ -119,6 +124,7 @@ impl Synthesizer {
             inverse_block_size,
             block_read,
             master_volume,
+            track_gains,
             effects,
         })
     }
@@ -132,6 +138,22 @@ impl Synthesizer {
     /// * `data1` - The first data part of the message.
     /// * `data2` - The second data part of the message.
     pub fn process_midi_message(&mut self, channel: i32, command: i32, data1: i32, data2: i32) {
+        // Channel-only entry point: the SMF track is unknown, so route to the
+        // default track (gain 1.0).
+        self.process_midi_message_with_track(channel, command, data1, data2, 0);
+    }
+
+    /// Processes a MIDI message that originates from `track`, so note-on/off
+    /// carry track identity into the voices they create (used for per-track
+    /// gain). Non-note events remain channel-scoped.
+    pub fn process_midi_message_with_track(
+        &mut self,
+        channel: i32,
+        command: i32,
+        data1: i32,
+        data2: i32,
+        track: usize,
+    ) {
         if !(0 <= channel && channel < self.channels.len() as i32) {
             return;
         }
@@ -139,8 +161,8 @@ impl Synthesizer {
         let channel_info = &mut self.channels[channel as usize];
 
         match command {
-            0x80 => self.note_off(channel, data1),       // Note Off
-            0x90 => self.note_on(channel, data1, data2), // Note On
+            0x80 => self.note_off_with_track(channel, data1, track),       // Note Off
+            0x90 => self.note_on_with_track(channel, data1, data2, track), // Note On
             0xB0 => match data1 // Controller
             {
                 0x00 => channel_info.set_bank(data2), // Bank Selection
@@ -179,12 +201,18 @@ impl Synthesizer {
     /// * `channel` - The channel of the note.
     /// * `key` - The key of the note.
     pub fn note_off(&mut self, channel: i32, key: i32) {
+        self.note_off_with_track(channel, key, 0);
+    }
+
+    /// Stops a note that originated from `track`, so two tracks sharing a
+    /// channel and key keep their voices independent.
+    pub fn note_off_with_track(&mut self, channel: i32, key: i32, track: usize) {
         if !(0 <= channel && channel < self.channels.len() as i32) {
             return;
         }
 
         for voice in self.voices.get_active_voices().iter_mut() {
-            if voice.channel() == channel && voice.key() == key {
+            if voice.channel() == channel && voice.track() == track && voice.key() == key {
                 voice.end();
             }
         }
@@ -198,8 +226,14 @@ impl Synthesizer {
     /// * `key` - The key of the note.
     /// * `velocity` - The velocity of the note.
     pub fn note_on(&mut self, channel: i32, key: i32, velocity: i32) {
+        self.note_on_with_track(channel, key, velocity, 0);
+    }
+
+    /// Starts a note that originated from `track`, carrying track identity into
+    /// the created voices for per-track gain.
+    pub fn note_on_with_track(&mut self, channel: i32, key: i32, velocity: i32, track: usize) {
         if velocity == 0 {
-            self.note_off(channel, key);
+            self.note_off_with_track(channel, key, track);
             return;
         }
 
@@ -240,7 +274,7 @@ impl Synthesizer {
                         let region_pair = RegionPair::new(preset_region, instrument_region);
 
                         if let Some(value) = self.voices.request_new(instrument_region, channel) {
-                            value.start(&region_pair, channel, key, velocity)
+                            value.start(&region_pair, channel, track, key, velocity)
                         }
                     }
                 }
@@ -366,8 +400,9 @@ impl Synthesizer {
         self.block_left.fill(0_f32);
         self.block_right.fill(0_f32);
         for voice in self.voices.get_active_voices().iter_mut() {
-            let previous_gain_left = self.master_volume * voice.previous_mix_gain_left;
-            let current_gain_left = self.master_volume * voice.current_mix_gain_left;
+            let track_gain = self.track_gains.get(voice.track()).copied().unwrap_or(1.0_f32);
+            let previous_gain_left = self.master_volume * track_gain * voice.previous_mix_gain_left;
+            let current_gain_left = self.master_volume * track_gain * voice.current_mix_gain_left;
             Synthesizer::write_block(
                 previous_gain_left,
                 current_gain_left,
@@ -375,8 +410,8 @@ impl Synthesizer {
                 &mut self.block_left[..],
                 self.inverse_block_size,
             );
-            let previous_gain_right = self.master_volume * voice.previous_mix_gain_right;
-            let current_gain_right = self.master_volume * voice.current_mix_gain_right;
+            let previous_gain_right = self.master_volume * track_gain * voice.previous_mix_gain_right;
+            let current_gain_right = self.master_volume * track_gain * voice.current_mix_gain_right;
             Synthesizer::write_block(
                 previous_gain_right,
                 current_gain_right,
@@ -395,8 +430,11 @@ impl Synthesizer {
             chorus_input_left.fill(0_f32);
             chorus_input_right.fill(0_f32);
             for voice in self.voices.get_active_voices().iter_mut() {
-                let previous_gain_left = voice.previous_chorus_send * voice.previous_mix_gain_left;
-                let current_gain_left = voice.current_chorus_send * voice.current_mix_gain_left;
+                let track_gain = self.track_gains.get(voice.track()).copied().unwrap_or(1.0_f32);
+                let previous_gain_left =
+                    track_gain * voice.previous_chorus_send * voice.previous_mix_gain_left;
+                let current_gain_left =
+                    track_gain * voice.current_chorus_send * voice.current_mix_gain_left;
                 Synthesizer::write_block(
                     previous_gain_left,
                     current_gain_left,
@@ -405,8 +443,9 @@ impl Synthesizer {
                     self.inverse_block_size,
                 );
                 let previous_gain_right =
-                    voice.previous_chorus_send * voice.previous_mix_gain_right;
-                let current_gain_right = voice.current_chorus_send * voice.current_mix_gain_right;
+                    track_gain * voice.previous_chorus_send * voice.previous_mix_gain_right;
+                let current_gain_right =
+                    track_gain * voice.current_chorus_send * voice.current_mix_gain_right;
                 Synthesizer::write_block(
                     previous_gain_right,
                     current_gain_right,
@@ -438,10 +477,13 @@ impl Synthesizer {
             let reverb_output_right = &mut effects.reverb_output_right[..];
             reverb_input.fill(0_f32);
             for voice in self.voices.get_active_voices().iter_mut() {
-                let previous_gain = reverb.get_input_gain()
+                let track_gain = self.track_gains.get(voice.track()).copied().unwrap_or(1.0_f32);
+                let previous_gain = track_gain
+                    * reverb.get_input_gain()
                     * voice.previous_reverb_send
                     * (voice.previous_mix_gain_left + voice.previous_mix_gain_right);
-                let current_gain = reverb.get_input_gain()
+                let current_gain = track_gain
+                    * reverb.get_input_gain()
                     * voice.current_reverb_send
                     * (voice.current_mix_gain_left + voice.current_mix_gain_right);
                 Synthesizer::write_block(
@@ -523,6 +565,17 @@ impl Synthesizer {
     /// * `value` - The new value of the master volume.
     pub fn set_master_volume(&mut self, value: f32) {
         self.master_volume = value;
+    }
+
+    /// Sets the gain for an SMF track (1.0 = unity, 0.0 = mute). Applied to
+    /// every active voice of that track during rendering, so changes affect
+    /// already-sounding notes on the next block. The table grows to fit the
+    /// requested track; tracks never set default to 1.0.
+    pub fn set_track_gain(&mut self, track: usize, gain: f32) {
+        if self.track_gains.len() <= track {
+            self.track_gains.resize(track + 1, 1.0_f32);
+        }
+        self.track_gains[track] = gain;
     }
 }
 
