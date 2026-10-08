@@ -44,6 +44,11 @@ pub struct Synthesizer {
     /// Indexed by track id; grows on demand in [`Self::set_track_gain`].
     track_gains: Vec<f32>,
 
+    /// Per-(track, channel) gain (1.0 = unity), applied on top of the track
+    /// gain. Flat: index = `track * CHANNEL_COUNT + channel`; grows on demand
+    /// in [`Self::set_track_channel_gain`].
+    track_channel_gains: Vec<f32>,
+
     effects: Option<Effects>,
 }
 
@@ -103,6 +108,7 @@ impl Synthesizer {
 
         let master_volume = 0.5_f32;
         let track_gains = vec![1.0_f32];
+        let track_channel_gains = vec![1.0_f32; Synthesizer::CHANNEL_COUNT];
 
         let effects = if settings.enable_reverb_and_chorus {
             Some(Effects::new(settings))
@@ -125,6 +131,7 @@ impl Synthesizer {
             block_read,
             master_volume,
             track_gains,
+            track_channel_gains,
             effects,
         })
     }
@@ -400,9 +407,15 @@ impl Synthesizer {
         self.block_left.fill(0_f32);
         self.block_right.fill(0_f32);
         for voice in self.voices.get_active_voices().iter_mut() {
-            let track_gain = self.track_gains.get(voice.track()).copied().unwrap_or(1.0_f32);
-            let previous_gain_left = self.master_volume * track_gain * voice.previous_mix_gain_left;
-            let current_gain_left = self.master_volume * track_gain * voice.current_mix_gain_left;
+            let track = voice.track();
+            let channel = voice.channel() as usize;
+            let route_gain = self.track_gains.get(track).copied().unwrap_or(1.0_f32)
+                * self.track_channel_gains
+                    .get(track * Synthesizer::CHANNEL_COUNT + channel)
+                    .copied()
+                    .unwrap_or(1.0_f32);
+            let previous_gain_left = self.master_volume * route_gain * voice.previous_mix_gain_left;
+            let current_gain_left = self.master_volume * route_gain * voice.current_mix_gain_left;
             Synthesizer::write_block(
                 previous_gain_left,
                 current_gain_left,
@@ -410,8 +423,8 @@ impl Synthesizer {
                 &mut self.block_left[..],
                 self.inverse_block_size,
             );
-            let previous_gain_right = self.master_volume * track_gain * voice.previous_mix_gain_right;
-            let current_gain_right = self.master_volume * track_gain * voice.current_mix_gain_right;
+            let previous_gain_right = self.master_volume * route_gain * voice.previous_mix_gain_right;
+            let current_gain_right = self.master_volume * route_gain * voice.current_mix_gain_right;
             Synthesizer::write_block(
                 previous_gain_right,
                 current_gain_right,
@@ -430,11 +443,17 @@ impl Synthesizer {
             chorus_input_left.fill(0_f32);
             chorus_input_right.fill(0_f32);
             for voice in self.voices.get_active_voices().iter_mut() {
-                let track_gain = self.track_gains.get(voice.track()).copied().unwrap_or(1.0_f32);
+                let track = voice.track();
+                let channel = voice.channel() as usize;
+                let route_gain = self.track_gains.get(track).copied().unwrap_or(1.0_f32)
+                    * self.track_channel_gains
+                        .get(track * Synthesizer::CHANNEL_COUNT + channel)
+                        .copied()
+                        .unwrap_or(1.0_f32);
                 let previous_gain_left =
-                    track_gain * voice.previous_chorus_send * voice.previous_mix_gain_left;
+                    route_gain * voice.previous_chorus_send * voice.previous_mix_gain_left;
                 let current_gain_left =
-                    track_gain * voice.current_chorus_send * voice.current_mix_gain_left;
+                    route_gain * voice.current_chorus_send * voice.current_mix_gain_left;
                 Synthesizer::write_block(
                     previous_gain_left,
                     current_gain_left,
@@ -443,9 +462,9 @@ impl Synthesizer {
                     self.inverse_block_size,
                 );
                 let previous_gain_right =
-                    track_gain * voice.previous_chorus_send * voice.previous_mix_gain_right;
+                    route_gain * voice.previous_chorus_send * voice.previous_mix_gain_right;
                 let current_gain_right =
-                    track_gain * voice.current_chorus_send * voice.current_mix_gain_right;
+                    route_gain * voice.current_chorus_send * voice.current_mix_gain_right;
                 Synthesizer::write_block(
                     previous_gain_right,
                     current_gain_right,
@@ -477,12 +496,18 @@ impl Synthesizer {
             let reverb_output_right = &mut effects.reverb_output_right[..];
             reverb_input.fill(0_f32);
             for voice in self.voices.get_active_voices().iter_mut() {
-                let track_gain = self.track_gains.get(voice.track()).copied().unwrap_or(1.0_f32);
-                let previous_gain = track_gain
+                let track = voice.track();
+                let channel = voice.channel() as usize;
+                let route_gain = self.track_gains.get(track).copied().unwrap_or(1.0_f32)
+                    * self.track_channel_gains
+                        .get(track * Synthesizer::CHANNEL_COUNT + channel)
+                        .copied()
+                        .unwrap_or(1.0_f32);
+                let previous_gain = route_gain
                     * reverb.get_input_gain()
                     * voice.previous_reverb_send
                     * (voice.previous_mix_gain_left + voice.previous_mix_gain_right);
-                let current_gain = track_gain
+                let current_gain = route_gain
                     * reverb.get_input_gain()
                     * voice.current_reverb_send
                     * (voice.current_mix_gain_left + voice.current_mix_gain_right);
@@ -576,6 +601,21 @@ impl Synthesizer {
             self.track_gains.resize(track + 1, 1.0_f32);
         }
         self.track_gains[track] = gain;
+    }
+
+    /// Sets the gain for a single (track, channel) pair (1.0 = unity,
+    /// 0.0 = mute). Multiplies with the track gain during rendering, so a
+    /// track can be balanced per channel without conflating it with MIDI CC7.
+    /// Channels outside `0..CHANNEL_COUNT` are ignored.
+    pub fn set_track_channel_gain(&mut self, track: usize, channel: usize, gain: f32) {
+        if channel >= Synthesizer::CHANNEL_COUNT {
+            return;
+        }
+        let required = (track + 1) * Synthesizer::CHANNEL_COUNT;
+        if self.track_channel_gains.len() < required {
+            self.track_channel_gains.resize(required, 1.0_f32);
+        }
+        self.track_channel_gains[track * Synthesizer::CHANNEL_COUNT + channel] = gain;
     }
 }
 
