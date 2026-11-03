@@ -120,6 +120,19 @@ impl BinaryReader {
         reader.read_exact(&mut data)
     }
 
+    /// Skips the 1-byte pad that follows an odd-sized chunk in a RIFF LIST.
+    /// RIFF requires every chunk to start on an even byte boundary, so a
+    /// subchunk whose `ckSize` is odd is followed by a single pad byte that is
+    /// NOT included in `ckSize`. Callers must advance past it before reading
+    /// the next subchunk's id. This is a no-op for even-sized chunks.
+    pub(crate) fn skip_pad<R: Read>(reader: &mut R, size: usize) -> Result<(), io::Error> {
+        if size % 2 == 1 {
+            let mut data: [u8; 1] = [0; 1];
+            reader.read_exact(&mut data)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn read_wave_data<R: Read>(
         reader: &mut R,
         size: usize,

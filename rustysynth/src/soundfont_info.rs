@@ -80,6 +80,8 @@ impl SoundFontInfo {
                 b"ISFT" => tools = Some(BinaryReader::read_fixed_length_string(reader, size)?),
                 _ => return Err(SoundFontError::ListContainsUnknownId(id)),
             }
+
+            BinaryReader::skip_pad(reader, size)?;
         }
 
         let version = version.unwrap_or_else(SoundFontVersion::default);

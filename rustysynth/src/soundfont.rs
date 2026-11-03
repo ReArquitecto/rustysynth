@@ -220,4 +220,154 @@ mod tests {
             Err(SoundFontError::SampleDataNotFound)
         ));
     }
+
+    // Regression test for the RIFF pad-byte bug: a subchunk whose `ckSize` is
+    // odd is followed by a 1-byte pad (so every chunk starts on an even byte
+    // boundary). The parser used to consume exactly `size` bytes and then read
+    // the next subchunk id one byte early, yielding `ListContainsUnknownId`
+    // (the "?LIS" failure seen with SF3's compressed, odd-sized `smpl`). SF2
+    // never tripped it because every SF2 chunk is even-sized, so this builds a
+    // minimal in-memory SF2 whose INFO `INAM` is 3 bytes (odd) to exercise the
+    // pad-skip while keeping everything else valid.
+    #[test]
+    fn test_load_sf2_with_odd_sized_info_chunk() {
+        let bytes = build_minimal_sf2_with_odd_inam();
+        let sound_font = SoundFont::new(&mut std::io::Cursor::new(bytes)).unwrap();
+        assert_eq!(sound_font.get_info().get_bank_name(), "abc");
+    }
+
+    fn push_u16(buf: &mut Vec<u8>, value: u16) {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_i32(buf: &mut Vec<u8>, value: i32) {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn fixed_string(buf: &mut Vec<u8>, value: &str, len: usize) {
+        buf.extend_from_slice(value.as_bytes());
+        buf.resize(buf.len() + len - value.len(), 0);
+    }
+
+    // A single RIFF subchunk, applying the spec-required pad byte for odd data.
+    fn subchunk(id: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut chunk = Vec::with_capacity(8 + data.len() + 1);
+        chunk.extend_from_slice(id);
+        chunk.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        chunk.extend_from_slice(data);
+        if data.len() % 2 == 1 {
+            chunk.push(0);
+        }
+        chunk
+    }
+
+    fn list(list_type: &[u8; 4], subchunks: &[Vec<u8>]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(list_type);
+        for chunk in subchunks {
+            body.extend_from_slice(chunk);
+        }
+
+        let mut list = Vec::new();
+        list.extend_from_slice(b"LIST");
+        list.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        list.extend_from_slice(&body);
+        list
+    }
+
+    fn build_minimal_sf2_with_odd_inam() -> Vec<u8> {
+        // INFO list: ifil (2.0), an odd-sized INAM (bank name, 3 bytes) with its
+        // pad byte, and a trailing isng so the pad-skip is observable.
+        let mut ifil = Vec::new();
+        push_u16(&mut ifil, 2); // major
+        push_u16(&mut ifil, 0); // minor
+
+        let info = list(
+            b"INFO",
+            &[
+                subchunk(b"ifil", &ifil),
+                subchunk(b"INAM", b"abc"),
+                subchunk(b"isng", b"abcd"),
+            ],
+        );
+
+        // sdta list: a single smpl chunk with two frames of silence.
+        let sdta = list(b"sdta", &[subchunk(b"smpl", &[0, 0, 0, 0])]);
+
+        // pdta list: a minimal but valid preset/instrument/sample table.
+        let mut phdr = Vec::new();
+        fixed_string(&mut phdr, "Preset", 20);
+        push_u16(&mut phdr, 0); // patch
+        push_u16(&mut phdr, 0); // bank
+        push_u16(&mut phdr, 0); // zone_start_index
+        push_i32(&mut phdr, 0); // library
+        push_i32(&mut phdr, 0); // genre
+        push_i32(&mut phdr, 0); // morphology
+        fixed_string(&mut phdr, "EOP", 20); // terminal record
+        push_u16(&mut phdr, 0xFFFF); // patch (terminal)
+        push_u16(&mut phdr, 0xFFFF); // bank (terminal)
+        push_u16(&mut phdr, 1); // zone_start_index (terminal)
+        push_i32(&mut phdr, 0);
+        push_i32(&mut phdr, 0);
+        push_i32(&mut phdr, 0);
+
+        let mut pbag = Vec::new();
+        push_u16(&mut pbag, 0); // genNdx
+        push_u16(&mut pbag, 0); // modNdx
+        push_u16(&mut pbag, 0); // terminal genNdx
+        push_u16(&mut pbag, 0); // terminal modNdx
+
+        let pgen = subchunk(b"pgen", &[0, 0, 0, 0]); // one generator terminator
+
+        let mut inst = Vec::new();
+        fixed_string(&mut inst, "Instrument", 20);
+        push_u16(&mut inst, 0); // zone_start_index
+        fixed_string(&mut inst, "EOI", 20); // terminal record
+        push_u16(&mut inst, 1); // zone_start_index (terminal)
+
+        let mut ibag = Vec::new();
+        push_u16(&mut ibag, 0); // genNdx
+        push_u16(&mut ibag, 0); // modNdx
+        push_u16(&mut ibag, 0); // terminal genNdx
+        push_u16(&mut ibag, 0); // terminal modNdx
+
+        let igen = subchunk(b"igen", &[0, 0, 0, 0]); // one generator terminator
+
+        let mut shdr = Vec::new();
+        fixed_string(&mut shdr, "Sample", 20);
+        push_i32(&mut shdr, 0); // start
+        push_i32(&mut shdr, 1); // end
+        push_i32(&mut shdr, 0); // start_loop
+        push_i32(&mut shdr, 1); // end_loop
+        push_i32(&mut shdr, 44100); // sample_rate
+        shdr.push(60); // original_pitch
+        shdr.push(0); // pitch_correction
+        push_u16(&mut shdr, 0); // link
+        push_u16(&mut shdr, 1); // sample_type (mono)
+        fixed_string(&mut shdr, "EOS", 20); // terminal record
+        shdr.resize(shdr.len() + 26, 0); // 46 - 20 zero bytes
+
+        let pdta = list(
+            b"pdta",
+            &[
+                subchunk(b"phdr", &phdr),
+                subchunk(b"pbag", &pbag),
+                pgen,
+                subchunk(b"inst", &inst),
+                subchunk(b"ibag", &ibag),
+                igen,
+                subchunk(b"shdr", &shdr),
+            ],
+        );
+
+        // Assemble the RIFF container.
+        let mut file = Vec::new();
+        file.extend_from_slice(b"RIFF");
+        file.extend_from_slice(&((4 + info.len() + sdta.len() + pdta.len()) as u32).to_le_bytes());
+        file.extend_from_slice(b"sfbk");
+        file.extend_from_slice(&info);
+        file.extend_from_slice(&sdta);
+        file.extend_from_slice(&pdta);
+        file
+    }
 }

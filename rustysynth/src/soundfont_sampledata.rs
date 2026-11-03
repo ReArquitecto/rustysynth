@@ -72,6 +72,8 @@ impl SoundFontSampleData {
                 b"sm24" => BinaryReader::discard_data(reader, size)?,
                 _ => return Err(SoundFontError::ListContainsUnknownId(id)),
             }
+
+            BinaryReader::skip_pad(reader, size)?;
         }
 
         if let Some(wave_data) = wave_data {
