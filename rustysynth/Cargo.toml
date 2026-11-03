@@ -12,4 +12,11 @@ license = "MIT"
 keywords = ["soundfont", "midi", "synthesizer", "audio", "music"]
 categories = ["multimedia::audio"]
 
+[features]
+default = []
+# SF3 (Ogg Vorbis compressed sample data) decode. Optional so the default build
+# stays dependency-free for consumers that only ship SF2.
+sf3 = ["dep:lewton"]
+
 [dependencies]
+lewton = { version = "0.10", optional = true }
